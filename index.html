@@ -70,7 +70,7 @@
   .detail-line{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px dashed var(--line);}
   .detail-line:last-child{border-bottom:none;}
   .empty{text-align:center;color:#9a9484;padding:30px 0;}
-  #sync-status{font-size:.78rem;color:#8a8372;margin-bottom:10px;}
+  #sync-status{font-size:.78rem;color:#8a8372;margin-bottom:10px;cursor:pointer;padding:4px 0;}
   .reste{font-weight:700;color:var(--accent);}
   .form-title{font-weight:700;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;}
   .debt-form-panel{margin-bottom:10px;}
@@ -357,53 +357,119 @@ function normalizeDebt(d){
   });
   d.amount = d.items.reduce((s,i)=> s + (Number(i.qty)||0) * (Number(i.price)||0), 0);
   d.paid = d.payments.reduce((s,p)=> s + (Number(p.amount)||0), 0);
+  if(d.sig === undefined) d.sig = debtSig(d);
+  if(d.updatedAt === undefined) d.updatedAt = 0;
   return d;
 }
 
-function save(){
+const DIRTY_KEY = 'client-debts-dirty:v3';
+const DELETED_KEY = 'client-debts-deleted:v3';
+let syncBusy = false;
+
+function debtSig(d){
+  const c = Object.assign({}, d);
+  delete c.updatedAt; delete c.sig;
+  return JSON.stringify(c);
+}
+function touchChanged(){
+  const now = Date.now();
+  debts.forEach(d=>{
+    const sg = debtSig(d);
+    if(d.sig !== sg){ d.sig = sg; d.updatedAt = now; }
+  });
+}
+function persistLocal(){
   try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(debts)); }catch(e){}
+}
+function getDeleted(){
+  try{ return JSON.parse(localStorage.getItem(DELETED_KEY) || '[]'); }catch(e){ return []; }
+}
+function addDeleted(id){
+  const arr = getDeleted();
+  if(!arr.includes(id)) arr.push(id);
+  try{ localStorage.setItem(DELETED_KEY, JSON.stringify(arr)); }catch(e){}
+}
+function mergeDebts(local, cloud){
+  const deleted = new Set(getDeleted());
+  const map = new Map();
+  cloud.forEach(d=>{ if(!deleted.has(d.id)) map.set(d.id, d); });
+  local.forEach(d=>{
+    if(deleted.has(d.id)) return;
+    const c = map.get(d.id);
+    if(!c || (d.updatedAt||0) > (c.updatedAt||0)) map.set(d.id, d);
+  });
+  return Array.from(map.values()).sort((x,y)=> String(y.date||'').localeCompare(String(x.date||'')));
+}
+
+function save(){
+  touchChanged();
+  persistLocal();
+  try{ localStorage.setItem(DIRTY_KEY, '1'); }catch(e){}
   scheduleSync();
 }
 
 function scheduleSync(){
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(pushToCloud, 1200);
+  syncTimer = setTimeout(()=>pushToCloud(false), 1200);
 }
 
 function updateSyncStatus(state){
   const el = document.getElementById('sync-status');
+  const hhmm = new Date().toLocaleTimeString('fr-FR', {hour:'2-digit', minute:'2-digit'});
   const labels = {
     syncing: '🔄 Synchronisation…',
-    synced: '🟢 Synchronisé',
+    synced: '🟢 Synchronisé à ' + hhmm + ' (touche ici pour actualiser)',
     offline: '⚪ Hors ligne (données locales uniquement)',
-    conflict: '🟠 Conflit détecté, version du cloud rechargée',
-    error: '🔴 Erreur de synchronisation'
+    conflict: '🟠 Conflit détecté, modifications fusionnées',
+    error: '🔴 Erreur de synchronisation (touche ici pour réessayer)'
   };
   el.textContent = labels[state] || '';
 }
 
 async function pullFromCloud(forceOverwrite){
   if(API_URL.includes('COLLE_ICI')) { updateSyncStatus('offline'); return; }
+  if(syncBusy) return;
+  syncBusy = true;
   try{
     updateSyncStatus('syncing');
     const res = await fetch(API_URL);
     const data = await res.json();
-    if(data.items && (forceOverwrite || debts.length === 0)){
-      debts = data.items;
-      debts.forEach(normalizeDebt);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(debts));
-      render();
+    const localVersion = localStorage.getItem(VERSION_KEY);
+    const dirtyFlag = localStorage.getItem(DIRTY_KEY);   // '1' = pas encore envoyé, '0' = propre, null = inconnu
+    const cloudChanged = !data.version || data.version !== localVersion;
+    if(Array.isArray(data.items) && (forceOverwrite || cloudChanged || debts.length === 0)){
+      data.items.forEach(normalizeDebt);
+      if(!forceOverwrite && dirtyFlag !== '0' && debts.length > 0){
+        // des modifications locales non envoyées (ou état inconnu) : on fusionne sans rien perdre
+        debts = mergeDebts(debts, data.items);
+        persistLocal();
+        try{ localStorage.setItem(DIRTY_KEY, '1'); }catch(e){}
+        if(data.version) localStorage.setItem(VERSION_KEY, data.version);
+        render();
+        scheduleSync();
+      }else{
+        debts = data.items;
+        persistLocal();
+        try{ localStorage.setItem(DIRTY_KEY, '0'); }catch(e){}
+        if(data.version) localStorage.setItem(VERSION_KEY, data.version);
+        render();
+      }
+    }else if(data.version){
+      localStorage.setItem(VERSION_KEY, data.version);
     }
-    if(data.version) localStorage.setItem(VERSION_KEY, data.version);
     updateSyncStatus('synced');
   }catch(e){
     console.error('Cloud injoignable', e);
     updateSyncStatus('offline');
+  }finally{
+    syncBusy = false;
   }
 }
 
-async function pushToCloud(){
+async function pushToCloud(retried){
   if(API_URL.includes('COLLE_ICI')) { updateSyncStatus('offline'); return; }
+  if(syncBusy){ scheduleSync(); return; }
+  syncBusy = true;
   try{
     updateSyncStatus('syncing');
     const expectedVersion = localStorage.getItem(VERSION_KEY);
@@ -413,12 +479,29 @@ async function pushToCloud(){
     });
     const data = await res.json();
     if(data.conflict){
+      // un autre appareil a modifié entre-temps : on récupère le cloud, on fusionne, on renvoie
+      const r2 = await fetch(API_URL);
+      const cloud = await r2.json();
+      if(Array.isArray(cloud.items)){
+        cloud.items.forEach(normalizeDebt);
+        debts = mergeDebts(debts, cloud.items);
+        persistLocal();
+        render();
+      }
+      if(cloud.version) localStorage.setItem(VERSION_KEY, cloud.version);
+      if(!retried){
+        syncBusy = false;
+        return await pushToCloud(true);
+      }
       updateSyncStatus('conflict');
-      await pullFromCloud(true);
       return;
     }
     if(data.ok){
       localStorage.setItem(VERSION_KEY, data.version);
+      try{
+        localStorage.setItem(DIRTY_KEY, '0');
+        localStorage.removeItem(DELETED_KEY);
+      }catch(e){}
       updateSyncStatus('synced');
     }else{
       updateSyncStatus('error');
@@ -426,7 +509,16 @@ async function pushToCloud(){
   }catch(e){
     console.error('Erreur push', e);
     updateSyncStatus('error');
+  }finally{
+    syncBusy = false;
   }
+}
+
+function autoPull(){
+  if(document.hidden || syncBusy) return;
+  const dlg = document.getElementById('payment-dialog');
+  if(dlg && dlg.open) return;
+  pullFromCloud(false);
 }
 
 /* ---------- status ---------- */
@@ -669,6 +761,7 @@ function removePayment(id, index){
 
 function deleteDebt(id){
   if(!confirm('Supprimer cette entrée ?')) return;
+  addDeleted(id);
   debts = debts.filter(x=>x.id!==id);
   save(); render();
 }
@@ -815,6 +908,14 @@ document.getElementById('import-file').addEventListener('change', (e)=>{
   reader.readAsText(file);
   e.target.value = '';
 });
+
+document.getElementById('sync-status').addEventListener('click', ()=>{
+  if(localStorage.getItem(DIRTY_KEY) === '1'){ pushToCloud(false); } else { pullFromCloud(false); }
+});
+setInterval(autoPull, 30000);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) autoPull(); });
+window.addEventListener('focus', autoPull);
+window.addEventListener('online', ()=>{ if(localStorage.getItem(DIRTY_KEY) === '1'){ pushToCloud(false); } else { autoPull(); } });
 
 document.getElementById('f-date').value = todayStr();
 addItemRow();
